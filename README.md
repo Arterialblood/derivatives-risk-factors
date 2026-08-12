@@ -88,6 +88,31 @@ derivatives-risk-factors/
 ⑥ ETF内部换手（资金面验证：无增量支撑）
 ```
 
+
+## V3 交易策略
+
+本仓库在 `strategy/` 目录下包含完整的 V3 复合压力信号交易策略：
+
+- **策略文档**：[`strategy/README.md`](strategy/README.md) — 6大指标原理详解、代理变量设计、CSS算法、回测结果
+- **回测代码**：[`strategy/strategy_backtest_v3.py`](strategy/strategy_backtest_v3.py) — 6代理变量 + CSS + 48组参数网格搜索
+- **买卖图表**：[`strategy/generate_chart.py`](strategy/generate_chart.py) — 买卖点位 vs 科创50/沪深300走势对比图
+- **报告生成**：[`strategy/generate_report_v3.py`](strategy/generate_report_v3.py) — V2 vs V3 对比 HTML 报告
+
+### 回测表现（2025-09 ~ 2026-08, 219交易日）
+
+| 指标 | V3策略 | 沪深300买入持有 | 科创50买入持有 |
+|------|--------|----------------|----------------|
+| 总收益 | **+47.3%** | +5.1% | +28.4% |
+| 最大回撤 | **-13.3%** | -9.8% | -29.9% |
+| 夏普比率 | **1.76** | — | — |
+| 胜率 | 71.4% | — | — |
+
+### 核心设计
+
+6个衍生品风险指标（ETF异常/期货贴水/Gamma挤压/做市商对冲/SKEW/0DTE）→ 代理变量 → Z-score归一化 → 复合压力得分(CSS, 0-100) → 体制轮动
+
+详见 [`strategy/README.md`](strategy/README.md)。
+
 ## License
 
 MIT
