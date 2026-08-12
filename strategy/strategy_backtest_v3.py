@@ -447,6 +447,180 @@ def run_v3_strategy(kc_data, hs_data, zz_data,
     }
 
 
+# ────────────────────────────────────────
+# 当前信号输出：每次运行结束后打印当前因子值和买卖建议
+# ────────────────────────────────────────
+
+def output_current_signal(kc_data, hs_data, best_result, best_params):
+    """输出最新的6个因子值、CSS得分、当前持仓状态和买卖建议"""
+
+    def pad_to_n(s, n):
+        """把序列pad到长度n"""
+        return list(s) + [None] * (n - len(s))
+
+    kc = kc_data["kline"]
+    hs = hs_data["kline"]
+    n = len(kc)
+    kc_close = [d["close"] for d in kc]
+    kc_high = [d["high"] for d in kc]
+    kc_low = [d["low"] for d in kc]
+    kc_vol = [d["volume"] for d in kc]
+    hs_close = [d["close"] for d in hs]
+    returns = calc_daily_returns(kc_close)
+
+    # 计算6个代理变量（returns长度为n-1，需要对齐到n）
+    etf_anom = proxy_etf_anomaly(kc_high, kc_low, kc_close)
+    basis = proxy_futures_basis(kc_close, hs_close)
+    gex = proxy_gex(returns)
+    hedge = proxy_dealer_hedge(returns)
+    skew = proxy_skew(returns)
+    vol_ratio = proxy_0dte(kc_vol)
+
+    # 对齐到价格数组长度n（returns-based的因子需要前移1位+补None）
+    def align_to_n(s, n):
+        """把returns-based的序列(长度n-1)对齐到价格数组(长度n)"""
+        return [None] + list(s)  # 前面补一个None，因为returns[0]对应price[1]
+
+    z_etf = zscore_to_score(pad_to_n(etf_anom, n))
+    z_basis = zscore_to_score(pad_to_n(basis, n))
+    z_gex = zscore_to_score(pad_to_n(align_to_n(gex, n), n))
+    z_hedge = zscore_to_score(pad_to_n(align_to_n(hedge, n), n))
+    z_skew = zscore_to_score(pad_to_n(align_to_n(skew, n), n))
+    z_vol = zscore_to_score(pad_to_n(vol_ratio, n))
+
+    # 复合CSS
+    css = [None] * n
+    for i in range(n):
+        z_values = []
+        for z in [z_etf[i], z_basis[i], z_gex[i], z_hedge[i], z_skew[i], z_vol[i]]:
+            if z is not None:
+                z_values.append(z)
+        if z_values:
+            css[i] = sum(z_values) / len(z_values)
+
+    # 获取最新一天的值
+    last_idx = n - 1
+    last_date = kc[last_idx]["date"]
+    last_price = kc_close[last_idx]
+
+    # MA20和ATR
+    sma20 = calc_sma(kc_close, 20)
+    atr = calc_atr(kc_high, kc_low, kc_close, 14)
+    last_ma = sma20[last_idx]
+    last_atr = atr[last_idx]
+    last_css = css[last_idx]
+
+    # 当前持仓状态（从回测结果获取）
+    last_dv = best_result['daily_values'][-1]
+    current_position = last_dv['position']
+
+    # Regime判断
+    if last_css is None:
+        regime = 'transition'
+    elif last_css < best_params['calm']:
+        regime = 'calm'
+    elif last_css > best_params['crisis']:
+        regime = 'crisis'
+    else:
+        regime = 'transition'
+
+    # 生成买卖建议
+    if current_position == 'kc':
+        trailing_stop = last_price - best_params['atr_m'] * last_atr if last_atr else last_price * 0.92
+        hard_stop = last_price * (1 - 0.08)
+        effective_stop = max(trailing_stop, hard_stop)
+        recommendation = f"持有科创50ETF (当前价 {last_price:.3f})"
+        recommendation += f" | 跟踪止损: {effective_stop:.3f} ({(effective_stop/last_price-1)*100:.1f}%)"
+        action = 'HOLD_KC'
+    elif current_position == 'zz':
+        hard_stop = last_price * (1 - 0.08)  # 简化：用KC价格做参考
+        recommendation = f"持有中证1000ETF"
+        action = 'HOLD_ZZ'
+    else:
+        # 空仓 → 检查是否应该入场
+        if regime == 'calm' and last_ma is not None and last_price > last_ma:
+            recommendation = (f"建议买入科创50ETF "
+                            f"(CSS={last_css:.1f}<{best_params['calm']}, "
+                            f"价格{last_price:.3f}>MA20={last_ma:.3f})")
+            action = 'BUY_KC'
+        elif regime == 'crisis':
+            recommendation = (f"建议轮动到中证1000ETF "
+                            f"(CSS={last_css:.1f}>{best_params['crisis']})")
+            action = 'BUY_ZZ'
+        else:
+            recommendation = (f"观望 (CSS={last_css:.1f}, 体制={regime})")
+            action = 'WAIT'
+
+    # 因子值表
+    factor_values = {
+        '①ETF异常': z_etf[last_idx],
+        '②期货贴水': z_basis[last_idx],
+        '③Gamma挤压': z_gex[last_idx],
+        '④做市商对冲': z_hedge[last_idx],
+        '⑤SKEW': z_skew[last_idx],
+        '⑥0DTE爆量': z_vol[last_idx],
+        '★复合CSS': last_css,
+    }
+
+    # 打印
+    print(f'\n{"="*60}')
+    print(f'  当前信号快照 — {last_date}')
+    print(f'{"="*60}')
+    print(f'\n  6个因子值 (0=最安全, 100=最危险):')
+    for name, val in factor_values.items():
+        if val is not None:
+            bar_len = int(val / 5)
+            bar = '█' * bar_len + '░' * (20 - bar_len)
+            status = '⚠️危险' if val > 75 else ('⚡注意' if val > 50 else '✅安全')
+            print(f'  {name:12s} {val:6.1f} |{bar}| {status}')
+        else:
+            print(f'  {name:12s}   N/A  |{"?"*20}| 数据不足')
+
+    print(f'\n  市场状态:')
+    print(f'    科创50ETF价格:  {last_price:.3f}')
+    print(f'    MA20:           {last_ma:.3f}' if last_ma else '    MA20:           N/A')
+    print(f'    ATR(14):        {last_atr:.4f}' if last_atr else '    ATR(14):        N/A')
+    print(f'    复合压力得分:   {last_css:.1f}' if last_css else '    复合压力得分:   N/A')
+    print(f'    市场体制:       {regime}')
+    print(f'    当前持仓:       {current_position or "空仓"}')
+
+    print(f'\n  >> 建议: {recommendation}')
+    print(f'{"="*60}\n')
+
+    # 保存到文件
+    signal_output = {
+        'date': last_date,
+        'factors': {k: round(v, 2) if v is not None else None for k, v in factor_values.items()},
+        'market': {
+            'price': round(last_price, 4),
+            'ma20': round(last_ma, 4) if last_ma else None,
+            'atr14': round(last_atr, 6) if last_atr else None,
+            'css': round(last_css, 2) if last_css else None,
+            'regime': regime,
+        },
+        'position': current_position,
+        'action': action,
+        'recommendation': recommendation,
+    }
+
+    with open(DATA_DIR.parent / 'current_signal.json', 'w') as f:
+        json.dump(signal_output, f, ensure_ascii=False, indent=2)
+
+    print(f'当前信号已保存到 current_signal.json')
+    return signal_output
+
+
+def zscore_to_score(series):
+    """把单因子序列做z-score后映射到0-100"""
+    valid = [v for v in series if v is not None]
+    if not valid:
+        return series
+    import statistics
+    mu = statistics.mean(valid)
+    sd = statistics.stdev(valid) if len(valid) > 1 else 0.001
+    return [max(0, min(100, 50 + (v - mu) / sd * 25)) if v is not None else None for v in series]
+
+
 def main():
     kc_data = load_kline('kechuang50_etf.json')
     hs_data = load_kline('hs300_etf.json')
@@ -558,6 +732,9 @@ def main():
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f'\n完整结果已保存到 backtest_v3_results.json')
+
+    # 输出当前因子值和买卖建议
+    output_current_signal(kc_data, hs_data, best, best_params)
 
 
 if __name__ == '__main__':
